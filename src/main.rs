@@ -177,7 +177,7 @@ struct CauseStat {
 struct TimelineEvent {
     time_tick: u32,
     event: String,
-    damage: f64,
+    damage: Option<f64>,
     me_hp_after: f64,
     enemy_hp_after: f64,
     lethal_side: Option<Side>,
@@ -239,6 +239,7 @@ impl LethalStat {
 #[derive(Clone, Default)]
 struct TimelineStat {
     damage_sum: f64,
+    damage_count: usize,
     me_hp_after: TimelineHpStat,
     enemy_hp_after: TimelineHpStat,
     count: usize,
@@ -662,6 +663,7 @@ impl Battle {
                 },
                 1.0,
             );
+            self.record_timeline_event(parry_event_text(defender, attacker), None, None);
             self.on_parry_success(defender);
             self.on_own_item_disabled(attacker);
             true
@@ -758,6 +760,15 @@ impl Battle {
         } else {
             None
         };
+        self.record_timeline_event(event, Some(damage), lethal_side);
+    }
+
+    fn record_timeline_event(
+        &mut self,
+        event: String,
+        damage: Option<f64>,
+        lethal_side: Option<Side>,
+    ) {
         let me_hp_after = self.players[Side::Me.idx()].hp.max(0.0);
         let enemy_hp_after = self.players[Side::Enemy.idx()].hp.max(0.0);
         self.timeline_events.push(TimelineEvent {
@@ -1321,6 +1332,9 @@ impl Battle {
     }
 
     fn record_reason(&mut self, tag: EventTag, amount: f64) {
+        if let Some(event) = timeline_reason_text(&tag) {
+            self.record_timeline_event(event, None, None);
+        }
         let b = self.cur_bucket();
         let stat = self.events[b].reasons.entry(tag).or_default();
         stat.amount += amount;
@@ -1379,7 +1393,10 @@ fn merge_timeline(dst: &mut BTreeMap<(u32, String), TimelineStat>, src: &[Timeli
         let stat = dst
             .entry((event.time_tick, event.event.clone()))
             .or_default();
-        stat.damage_sum += event.damage;
+        if let Some(damage) = event.damage {
+            stat.damage_sum += damage;
+            stat.damage_count += 1;
+        }
         stat.me_hp_after.add(event.me_hp_after);
         stat.enemy_hp_after.add(event.enemy_hp_after);
         stat.count += 1;
@@ -1417,7 +1434,7 @@ fn print_report(summary: &Summary, runs: usize, _me_items: &[Item], _enemy_items
     println!("核心时间线大概是：");
     println!("| 时间 | 事件 | 平均伤害 | 你的剩余血量 | 敌方剩余血量 | 击杀 |");
     println!("|---:|---|---:|---:|---:|---|");
-    for row in core_timeline(summary, runs, 8) {
+    for row in core_timeline(summary, runs) {
         println!(
             "| {} | {} | {} | {} | {} | {} |",
             row.time, row.event, row.damage, row.me_hp, row.enemy_hp, row.lethal
@@ -1434,7 +1451,7 @@ struct TimelineRow {
     lethal: String,
 }
 
-fn core_timeline(summary: &Summary, runs: usize, limit: usize) -> Vec<TimelineRow> {
+fn core_timeline(summary: &Summary, runs: usize) -> Vec<TimelineRow> {
     let mut rows = Vec::new();
     let min_count = (runs as f64 * 0.05).ceil() as usize;
     for ((time_tick, event), stat) in &summary.timeline {
@@ -1444,12 +1461,16 @@ fn core_timeline(summary: &Summary, runs: usize, limit: usize) -> Vec<TimelineRo
         rows.push(TimelineRow {
             time: format!("{:.2}s", *time_tick as f64 / 100.0),
             event: event.clone(),
-            damage: format!("{:.0}", stat.damage_sum / stat.count as f64),
+            damage: if stat.damage_count == 0 {
+                "-".to_string()
+            } else {
+                format!("{:.0}", stat.damage_sum / stat.damage_count as f64)
+            },
             me_hp: stat.me_hp_after.label(),
             enemy_hp: stat.enemy_hp_after.label(),
             lethal: stat.lethal.label(stat.count),
         });
-        if stat.lethal.is_majority_lethal(stat.count) || rows.len() >= limit {
+        if stat.lethal.is_majority_lethal(stat.count) {
             break;
         }
     }
@@ -1470,6 +1491,76 @@ fn damage_event_text(attacker: Side, cause: &'static str) -> String {
         other => other,
     };
     format!("{side} {action}")
+}
+
+fn parry_event_text(defender: Side, attacker: Side) -> String {
+    match (defender, attacker) {
+        (Side::Me, Side::Enemy) => "你振刀成功，敌方硬直 3 秒".to_string(),
+        (Side::Enemy, Side::Me) => "敌方振刀成功，你方硬直 3 秒".to_string(),
+        _ => "振刀成功，攻击方硬直 3 秒".to_string(),
+    }
+}
+
+fn timeline_reason_text(reason: &EventTag) -> Option<String> {
+    match reason {
+        EventTag::StartMaxHp { .. }
+        | EventTag::StartSword { .. }
+        | EventTag::StartArmor { .. }
+        | EventTag::StartReduction { .. }
+        | EventTag::Damage { .. }
+        | EventTag::ArmorAbsorb { .. }
+        | EventTag::Stagger { .. } => None,
+        EventTag::ArmorGain { side, source } => {
+            Some(format!("{}{}触发护甲提升", timeline_side(*side), source))
+        }
+        EventTag::AttackBoost { side, source } => {
+            if source.contains("攻击力") {
+                Some(format!("{}{}", timeline_side(*side), source))
+            } else {
+                Some(format!("{}{}提升武器攻击力", timeline_side(*side), source))
+            }
+        }
+        EventTag::Heal { side, source } => {
+            Some(format!("{}{}触发治疗", timeline_side(*side), source))
+        }
+        EventTag::Freeze {
+            source,
+            source_name,
+            target,
+        } => Some(format!(
+            "{}{}冻结{}读条道具",
+            timeline_side(*source),
+            source_name,
+            timeline_target(*target)
+        )),
+        EventTag::Charge { side, source } => {
+            if source.contains("充能") {
+                Some(format!("{}{}", timeline_side(*side), source))
+            } else {
+                Some(format!("{}{}推进读条", timeline_side(*side), source))
+            }
+        }
+        EventTag::Accelerate { side, source } => {
+            Some(format!("{}{}触发加速", timeline_side(*side), source))
+        }
+        EventTag::Slow { side, source } => {
+            Some(format!("{}{}触发减速", timeline_side(*side), source))
+        }
+    }
+}
+
+fn timeline_side(side: Side) -> &'static str {
+    match side {
+        Side::Me => "你方",
+        Side::Enemy => "敌方",
+    }
+}
+
+fn timeline_target(side: Side) -> &'static str {
+    match side {
+        Side::Me => "你方",
+        Side::Enemy => "敌方",
+    }
 }
 
 #[allow(dead_code)]
