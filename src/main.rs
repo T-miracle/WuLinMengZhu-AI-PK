@@ -5,7 +5,9 @@ use std::io::{self, Read};
 
 mod equipment;
 
-use equipment::StarProfile;
+use equipment::{ActionSpec, StarProfile};
+
+// 战场固定为 5x4 背包格，按离散时间步推进整场模拟。
 
 const WIDTH: usize = 4;
 const HEIGHT: usize = 5;
@@ -14,6 +16,7 @@ const DT: f64 = 0.05;
 const DEFAULT_RUNS: usize = 2400;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+// 双方阵营，很多统计和索引都围绕它展开。
 enum Side {
     Me,
     Enemy,
@@ -27,6 +30,7 @@ impl Side {
         }
     }
 
+    // 便于把阵营映射到 players[0/1]。
     fn idx(self) -> usize {
         match self {
             Side::Me => 0,
@@ -36,6 +40,7 @@ impl Side {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// 装备大类会影响是否读条、是否吃某些联动。
 enum Kind {
     Weapon,
     Charm,
@@ -45,9 +50,9 @@ enum Kind {
 }
 
 #[derive(Clone, Copy, Debug)]
+// 来自数据库的装备静态定义，不包含战斗中的临时状态。
 struct Def {
     short: &'static str,
-    full: &'static str,
     kind: Kind,
     w: usize,
     h: usize,
@@ -55,21 +60,17 @@ struct Def {
     interval: f64,
 }
 
-fn defs() -> Vec<Def> {
+fn defs() -> Result<Vec<Def>, String> {
     equipment::specs()
-        .iter()
-        .map(|spec| {
-            let _property_count = spec.properties.len();
-            spec.def
-        })
-        .collect()
 }
 
 #[derive(Clone)]
+// 一件实际参战的装备实例，保存星级、位置和战斗中的动态数值。
 struct Item {
     def: Def,
     _star: Option<u8>,
     star_profile: Option<StarProfile>,
+    actions_by_trigger: HashMap<String, Vec<ActionSpec>>,
     cells: Vec<(usize, usize)>,
     attack_bonus: f64,
     progress: f64,
@@ -124,6 +125,7 @@ impl Item {
 }
 
 #[derive(Clone)]
+// 单方战斗状态：背包里的装备、血量、护甲和剑势都放这里。
 struct Player {
     items: Vec<Item>,
     hp: f64,
@@ -134,13 +136,8 @@ struct Player {
     stagger_until: f64,
 }
 
-impl Player {
-    fn has(&self, name: &str) -> bool {
-        self.items.iter().any(|i| i.def.short == name)
-    }
-}
-
 #[derive(Clone)]
+// 一场完整模拟的运行时容器，负责推进时间和结算事件。
 struct Battle {
     players: [Player; 2],
     rng: Rng,
@@ -150,6 +147,7 @@ struct Battle {
 }
 
 #[derive(Clone, Default)]
+// 按时间桶汇总的统计，用来生成最终报告。
 struct Bucket {
     hp_me_sum: f64,
     hp_enemy_sum: f64,
@@ -174,6 +172,7 @@ struct CauseStat {
 }
 
 #[derive(Clone)]
+// 关键事件时间线，方便把一场战斗讲成人能读懂的过程。
 struct TimelineEvent {
     time_tick: u32,
     event: String,
@@ -311,6 +310,7 @@ enum EventTag {
 }
 
 #[derive(Default)]
+// 多次模拟合并后的总览结果。
 struct Summary {
     buckets: Vec<Bucket>,
     timeline: BTreeMap<(u32, String), TimelineStat>,
@@ -321,6 +321,7 @@ struct Summary {
 }
 
 #[derive(Clone)]
+// 轻量随机数，用来抽取冻结/加速目标并打散出手顺序。
 struct Rng(u64);
 
 impl Rng {
@@ -357,6 +358,7 @@ fn main() {
     }
 }
 
+// 解析参数、读取阵容、批量执行模拟并输出报告。
 fn run() -> Result<(), String> {
     let mut runs = DEFAULT_RUNS;
     let mut seed = 20260706_u64;
@@ -381,7 +383,6 @@ fn run() -> Result<(), String> {
             }
             "--help" | "-h" => {
                 print_help();
-                return Ok(());
             }
             path => input_path = Some(path.to_string()),
         }
@@ -413,7 +414,7 @@ fn run() -> Result<(), String> {
         let battle = Battle::new(
             me_items.clone(),
             enemy_items.clone(),
-            seed ^ ((run_idx as u64 + 1) * 0xA24B_AED4_963E_E407),
+            seed ^ (run_idx as u64 + 1).wrapping_mul(0xA24B_AED4_963E_E407),
         );
         let (winner, end_time, buckets, timeline_events) = battle.simulate();
         match winner {
@@ -431,6 +432,7 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+// 命令行帮助保持得尽量短，方便直接在终端查看。
 fn print_help() {
     println!("用法: cargo run --release -- [input.txt] [--runs 2400] [--seed 20260706]");
     println!("不传 input.txt 时读取 stdin；stdin 为空时使用内置示例。");
@@ -450,6 +452,7 @@ impl Battle {
         b
     }
 
+    // 主循环按固定步长推进，直到分出胜负或到达时限。
     fn simulate(mut self) -> (Option<Side>, f64, Vec<Bucket>, Vec<TimelineEvent>) {
         let steps = (MAX_TIME / DT).round() as usize;
         for step in 0..=steps {
@@ -458,7 +461,7 @@ impl Battle {
             self.sample_hp(t);
             if self.players[0].hp <= 0.0 || self.players[1].hp <= 0.0 {
                 self.fill_remaining_hp(step + 1, steps);
-                return (self.winner(), t, self.events, self.timeline_events);
+                break;
             }
             if step == steps {
                 break;
@@ -484,16 +487,6 @@ impl Battle {
             let t = step as f64 * DT;
             self.time = t;
             self.sample_hp(t);
-        }
-    }
-
-    fn winner(&self) -> Option<Side> {
-        let me_dead = self.players[0].hp <= 0.0;
-        let enemy_dead = self.players[1].hp <= 0.0;
-        match (me_dead, enemy_dead) {
-            (true, false) => Some(Side::Enemy),
-            (false, true) => Some(Side::Me),
-            _ => None,
         }
     }
 
@@ -551,28 +544,7 @@ impl Battle {
             if idx >= self.players[side.idx()].items.len() {
                 continue;
             }
-            match self.players[side.idx()].items[idx].def.short {
-                "冰魄" => {
-                    let sword_gain = self.players[side.idx()].items[idx].normal_sword_gain(16.0);
-                    self.normal_attack(side, idx, sword_gain, "冰魄普通攻击", true);
-                }
-                "龙弧" => self.longhu_attack(side, idx),
-                "烛神令" => self.zhushenling_attack(side, idx),
-                "冰髓" => {
-                    self.freeze_random(side, side.other(), 2, 1.5, t, "冰髓");
-                    self.players[side.idx()].sword += 10.0;
-                }
-                "寒冰核" => self.freeze_random(side, side.other(), 1, 3.5, t, "寒冰核"),
-                "缚命环" => {
-                    self.players[side.idx()].items[idx].used = true;
-                    self.heal(side, 90.0, "缚命环");
-                }
-                "蜃景苞" => {
-                    self.freeze_random(side, side.other(), 1, 1.1, t, "蜃景苞");
-                    self.charge_random(side, 1.5);
-                }
-                _ => {}
-            }
+            self.run_item_actions(side, idx, "active_use");
         }
     }
 
@@ -581,24 +553,27 @@ impl Battle {
         side: Side,
         item_idx: usize,
         sword_gain: f64,
-        cause: &'static str,
-        ice_po: bool,
+        source: &'static str,
+        freezes_after_hit: bool,
     ) {
         let dmg = self.players[side.idx()].items[item_idx].attack();
+        let cause = if freezes_after_hit {
+            leak_runtime_text(format!("{source} 普攻命中并继续冻结"))
+        } else {
+            leak_runtime_text(format!("{source} 普攻命中"))
+        };
         self.deal_damage(side, dmg, cause);
         self.count_attack(side);
         self.players[side.idx()].sword += sword_gain;
-        if self.players[side.idx()].has("混沌") {
-            self.players[side.idx()].sword += 8.0;
-        }
+        self.run_side_actions(side, "on_normal_attack");
         self.on_attack_hit(side);
         self.on_normal_hit(side);
-        if ice_po {
-            self.freeze_random(side, side.other(), 2, 2.0, 0.0, "冰魄");
+        if freezes_after_hit {
+            self.freeze_random(side, side.other(), 2, 2.0, 0.0, source);
         }
     }
 
-    fn longhu_attack(&mut self, side: Side, item_idx: usize) {
+    fn longhu_attack(&mut self, side: Side, item_idx: usize, source: &'static str) {
         if self.players[side.idx()].sword >= 28.0 {
             self.players[side.idx()].sword -= 28.0;
             if self.try_parry(side) {
@@ -606,21 +581,268 @@ impl Battle {
             }
             self.count_attack(side);
             let dmg = self.players[side.idx()].items[item_idx].attack() * 3.7;
-            self.deal_damage(side, dmg, "龙弧蓄力攻击");
+            self.deal_damage(side, dmg, leak_runtime_text(format!("{source} 蓄力命中")));
             let enemy_sword_loss =
                 self.players[side.idx()].items[item_idx].charged_enemy_sword_loss(16.0);
             self.players[side.other().idx()].sword =
                 (self.players[side.other().idx()].sword - enemy_sword_loss).max(0.0);
             self.on_attack_hit(side);
             self.on_charged_hit(side);
-            self.freeze_random(side, side.other(), 1, 2.0, 0.0, "龙弧");
+            self.freeze_random(side, side.other(), 1, 2.0, 0.0, source);
         } else {
             let sword_gain = self.players[side.idx()].items[item_idx].normal_sword_gain(16.0);
-            self.normal_attack(side, item_idx, sword_gain, "龙弧普通攻击", false);
+            self.normal_attack(side, item_idx, sword_gain, source, false);
         }
     }
 
-    fn zhushenling_attack(&mut self, side: Side, item_idx: usize) {
+    fn run_item_actions(&mut self, side: Side, item_idx: usize, trigger: &str) -> bool {
+        let actions = self.players[side.idx()].items[item_idx]
+            .actions_by_trigger
+            .get(trigger)
+            .cloned()
+            .unwrap_or_default();
+        if actions.is_empty() {
+            return false;
+        }
+        for action in actions {
+            self.apply_action_with_context(side, item_idx, &action, None);
+        }
+        true
+    }
+
+    // 处理“全队在某个触发点都要检查一次”的效果，例如治疗后、战斗开始等。
+    fn run_side_actions(&mut self, side: Side, trigger: &str) {
+        let len = self.players[side.idx()].items.len();
+        for idx in 0..len {
+            self.run_item_actions(side, idx, trigger);
+        }
+    }
+
+    // 某些联动需要知道“是谁被加速/被冻结了”，这里把上下文索引一起传下去。
+    fn run_side_actions_with_context(&mut self, side: Side, trigger: &str, context_idx: usize) {
+        let len = self.players[side.idx()].items.len();
+        for idx in 0..len {
+            let actions = self.players[side.idx()].items[idx]
+                .actions_by_trigger
+                .get(trigger)
+                .cloned()
+                .unwrap_or_default();
+            for action in actions {
+                self.apply_action_with_context(side, idx, &action, Some(context_idx));
+            }
+        }
+    }
+
+    // 只执行来源文本匹配的动作，适合冻结/命中后的来源联动。
+    fn run_source_actions(&mut self, side: Side, trigger: &str, source_name: &'static str) {
+        let len = self.players[side.idx()].items.len();
+        for idx in 0..len {
+            let actions = self.players[side.idx()].items[idx]
+                .actions_by_trigger
+                .get(trigger)
+                .cloned()
+                .unwrap_or_default();
+            for action in actions {
+                if action.source_text == source_name {
+                    self.apply_action_with_context(side, idx, &action, None);
+                }
+            }
+        }
+    }
+    // 数据库动作里的目标文本会先折算成实际阵营。
+    fn action_target_side(&self, side: Side, target: &str) -> Side {
+        if target.starts_with("enemy") {
+            side.other()
+        } else {
+            side
+        }
+    }
+
+    // 这里是数据库动作的小解释器：尽量把“装备名 -> 代码分支”改成“动作名 -> 通用执行”。
+    fn apply_action_with_context(
+        &mut self,
+        side: Side,
+        item_idx: usize,
+        action: &ActionSpec,
+        context_idx: Option<usize>,
+    ) {
+        let source = leak_runtime_text(action.source_text.clone());
+        let amount = action.amount.unwrap_or(0.0);
+        let duration = action.duration.unwrap_or(0.0);
+        let target_side = self.action_target_side(side, &action.target);
+        match action.action.as_str() {
+            "freezing_normal_weapon_attack" => {
+                let sword_gain = self.players[side.idx()].items[item_idx].normal_sword_gain(16.0);
+                self.normal_attack(side, item_idx, sword_gain, source, true);
+            }
+            "charged_sword_control_weapon_attack" => self.longhu_attack(side, item_idx, source),
+            "charged_healing_weapon_attack" => self.zhushenling_attack(side, item_idx, source),
+            "add_freeze_attack_stack" => self.add_freeze_attack_stack(side, item_idx, action),
+            "freeze_random" => {
+                let count = action.count.unwrap_or(1).max(0) as usize;
+                self.freeze_random(side, target_side, count, duration, self.time, source);
+            }
+            "freeze_all" => self.freeze_all(side, target_side, duration, source),
+            "start_sword" => {
+                self.players[target_side.idx()].sword += amount;
+                self.record_reason(
+                    EventTag::StartSword {
+                        side: target_side,
+                        source,
+                    },
+                    amount,
+                );
+            }
+            "sword" => {
+                self.players[target_side.idx()].sword += amount;
+            }
+            "enemy_sword" => {
+                self.players[side.other().idx()].sword =
+                    (self.players[side.other().idx()].sword - amount).max(0.0);
+            }
+            "heal" => self.heal(target_side, amount, source),
+            "heal_if_used" => {
+                if self.players[side.idx()].items[item_idx].used {
+                    self.heal(target_side, amount, source);
+                }
+            }
+            "charge_random" => self.charge_random(target_side, amount),
+            "charge_all_active" => self.charge_all_active(target_side, amount, source),
+            "charge_self" => {
+                self.players[side.idx()].items[item_idx].progress += amount;
+                self.record_reason(EventTag::Charge { side, source }, amount);
+            }
+            "charge_adjacent_active" => {
+                let cells = self.players[side.idx()].items[item_idx].cells.clone();
+                let targets = self.adjacent_active_items(target_side, &cells, false);
+                for idx in targets {
+                    self.players[target_side.idx()].items[idx].progress += amount;
+                    self.record_reason(
+                        EventTag::Charge {
+                            side: target_side,
+                            source,
+                        },
+                        amount,
+                    );
+                }
+            }
+            "mark_used" => self.players[side.idx()].items[item_idx].used = true,
+            "start_armor" => {
+                self.players[target_side.idx()].armor += amount;
+                self.record_reason(
+                    EventTag::StartArmor {
+                        side: target_side,
+                        source,
+                    },
+                    amount,
+                );
+            }
+            "armor" => {
+                self.players[target_side.idx()].armor += amount;
+                self.record_reason(
+                    EventTag::ArmorGain {
+                        side: target_side,
+                        source,
+                    },
+                    amount,
+                );
+            }
+            "max_hp" => {
+                self.players[target_side.idx()].max_hp += amount;
+                self.players[target_side.idx()].hp += amount;
+                self.record_reason(
+                    EventTag::StartMaxHp {
+                        side: target_side,
+                        source,
+                    },
+                    amount,
+                );
+            }
+            "damage_reduction" => {
+                self.players[target_side.idx()].damage_reduction += amount;
+                self.record_reason(
+                    EventTag::StartReduction {
+                        side: target_side,
+                        source,
+                    },
+                    amount * 100.0,
+                );
+            }
+            "add_weapon_attack" => self.add_weapon_attack(target_side, amount),
+            "add_weapon_attack_stacking" => {
+                let max_stacks = action.count.unwrap_or(0).max(0) as u32;
+                if self.bump_stack(side, item_idx, source, max_stacks) {
+                    self.add_weapon_attack(target_side, amount);
+                }
+            }
+            "add_adjacent_weapon_attack_stacking" => {
+                let max_stacks = action.count.unwrap_or(0).max(0) as u32;
+                if self.bump_stack(side, item_idx, source, max_stacks) {
+                    let cells = self.players[side.idx()].items[item_idx].cells.clone();
+                    for w in self.adjacent_weapons(target_side, &cells) {
+                        self.players[target_side.idx()].items[w].attack_bonus += amount;
+                    }
+                }
+            }
+            "add_adjacent_weapon_attack_stacking_if_adjacent_to_context" => {
+                if let Some(context_idx) = context_idx {
+                    let item_cells = self.players[side.idx()].items[item_idx].cells.clone();
+                    let target_cells = self.players[side.idx()].items[context_idx].cells.clone();
+                    let max_stacks = action.count.unwrap_or(0).max(0) as u32;
+                    if adjacent(&item_cells, &target_cells)
+                        && self.bump_stack(side, item_idx, source, max_stacks)
+                    {
+                        for w in self.adjacent_weapons(target_side, &item_cells) {
+                            self.players[target_side.idx()].items[w].attack_bonus += amount;
+                        }
+                        self.record_reason(
+                            EventTag::AttackBoost {
+                                side: target_side,
+                                source,
+                            },
+                            amount,
+                        );
+                    }
+                }
+            }
+            "slow_random" => self.slow_random(target_side, duration, source),
+            "accelerate_random" => self.accelerate_random(target_side, duration, source),
+            "accelerate_all_active" => self.accelerate_all_active(target_side, duration, source),
+            "accelerate_weapons" => self.accelerate_weapons(target_side, duration, source),
+            "accelerate_adjacent_weapons" => {
+                let cells = self.players[side.idx()].items[item_idx].cells.clone();
+                for idx in self.adjacent_weapons(target_side, &cells) {
+                    self.accelerate_item(target_side, idx, duration, source);
+                }
+            }
+            "accelerate_adjacent_active" => {
+                let cells = self.players[side.idx()].items[item_idx].cells.clone();
+                let targets = self.adjacent_active_items(target_side, &cells, false);
+                for idx in targets {
+                    self.accelerate_item(target_side, idx, duration, source);
+                }
+            }
+            "white_tiger_hit" => {
+                if !self.players[side.idx()].items[item_idx].used {
+                    self.players[side.idx()].items[item_idx].used = true;
+                    self.freeze_all(side, side.other(), duration, source);
+                    self.add_weapon_attack(side, amount);
+                }
+            }
+            "xuanwu_normal_hit" => {
+                if !self.players[side.idx()].items[item_idx].used {
+                    self.players[side.idx()].items[item_idx].used = true;
+                    self.players[side.idx()].max_hp += amount;
+                    self.record_reason(EventTag::StartMaxHp { side, source }, amount);
+                    self.heal(side, amount, source);
+                    self.add_weapon_attack(side, action.count.unwrap_or(0).max(0) as f64);
+                    self.accelerate_weapons(side, duration, source);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn zhushenling_attack(&mut self, side: Side, item_idx: usize, source: &'static str) {
         if self.players[side.idx()].sword >= 24.0 {
             self.players[side.idx()].sword -= 24.0;
             if self.try_parry(side) {
@@ -628,17 +850,17 @@ impl Battle {
             }
             self.count_attack(side);
             let dmg = self.players[side.idx()].items[item_idx].attack() * 2.25;
-            self.deal_damage(side, dmg, "烛神令蓄力攻击");
-            self.heal(side, 4.0, "烛神令生命恢复");
+            self.deal_damage(side, dmg, leak_runtime_text(format!("{source} 蓄力命中")));
+            self.heal(side, 4.0, leak_runtime_text(format!("{source}生命恢复")));
             self.on_attack_hit(side);
             self.on_charged_hit(side);
         } else {
             self.count_attack(side);
             let dmg = self.players[side.idx()].items[item_idx].attack();
-            self.deal_damage(side, dmg, "烛神令普通攻击");
+            self.deal_damage(side, dmg, leak_runtime_text(format!("{source} 普攻命中")));
             self.players[side.idx()].sword +=
                 self.players[side.idx()].items[item_idx].normal_sword_gain(14.0);
-            self.heal(side, 4.0, "烛神令生命恢复");
+            self.heal(side, 4.0, leak_runtime_text(format!("{source}生命恢复")));
             self.on_attack_hit(side);
             self.on_normal_hit(side);
         }
@@ -681,9 +903,10 @@ impl Battle {
         }
     }
 
+    // 先吃减伤，再走护甲，最后才扣生命。
     fn deal_damage(&mut self, attacker: Side, raw: f64, cause: &'static str) {
         let defender = attacker.other();
-        let will_trigger_white_tiger = self.will_trigger_white_tiger(attacker, cause);
+        let pending_hit_preview_source = self.pending_hit_preview_source(attacker);
         let p = &mut self.players[defender.idx()];
         let dmg = raw * (1.0 - p.damage_reduction);
         let from_armor = p.armor.min(dmg);
@@ -710,7 +933,7 @@ impl Battle {
                 defender,
                 cause,
                 hp_loss,
-                will_trigger_white_tiger,
+                pending_hit_preview_source,
             );
         }
         if from_armor > 0.0 {
@@ -723,14 +946,23 @@ impl Battle {
                 from_armor,
             );
         }
-        if self.players[defender.idx()].has("冻结") {
-            self.freeze_random(defender, attacker, 1, 2.0, 0.0, "冻结魂玉");
-        }
+        self.run_side_actions(defender, "on_damaged");
     }
 
-    fn will_trigger_white_tiger(&self, attacker: Side, _cause: &'static str) -> bool {
-        self.find_first(attacker, "白虎之力")
-            .is_some_and(|idx| !self.players[attacker.idx()].items[idx].used)
+    fn pending_hit_preview_source(&self, attacker: Side) -> Option<&'static str> {
+        self.players[attacker.idx()].items.iter().find_map(|item| {
+            if item.used {
+                return None;
+            }
+            item.actions_by_trigger
+                .get("on_attack_hit")
+                .and_then(|actions| {
+                    actions
+                        .iter()
+                        .find(|action| action.action == "white_tiger_hit")
+                        .map(|action| leak_runtime_text(action.source_text.clone()))
+                })
+        })
     }
 
     fn record_timeline_damage(
@@ -739,20 +971,20 @@ impl Battle {
         defender: Side,
         cause: &'static str,
         damage: f64,
-        will_trigger_white_tiger: bool,
+        pending_hit_preview_source: Option<&'static str>,
     ) {
         let mut event = damage_event_text(attacker, cause);
-        if will_trigger_white_tiger {
+        if let Some(source) = pending_hit_preview_source {
             if attacker == Side::Enemy {
-                event.push_str("，触发 白虎之力，同时冻结你所有道具 3 秒");
+                event.push_str(&format!("，触发 {source}，同时冻结你所有道具 3 秒"));
             } else {
-                event.push_str("，触发 白虎之力，同时冻结敌方所有道具 3 秒");
+                event.push_str(&format!("，触发 {source}，同时冻结敌方所有道具 3 秒"));
             }
-        } else if cause.contains("冰魄") {
+        } else if cause.contains("并继续冻结") {
             if attacker == Side::Enemy {
-                event.push_str("并继续冻结你方道具");
+                event.push_str("你方道具");
             } else {
-                event.push_str("并继续冻结敌方道具");
+                event.push_str("敌方道具");
             }
         }
         let lethal_side = if self.players[defender.idx()].hp <= 0.0 {
@@ -807,6 +1039,7 @@ impl Battle {
         self.on_heal(side);
     }
 
+    // 同一次多目标冻结不会重复选中同一件主动道具。
     fn freeze_random(
         &mut self,
         source: Side,
@@ -854,7 +1087,7 @@ impl Battle {
         self.on_freeze_triggered(source, source_name);
     }
 
-    fn freeze_all(&mut self, source: Side, target: Side, duration: f64) {
+    fn freeze_all(&mut self, source: Side, target: Side, duration: f64, source_name: &'static str) {
         let len = self.players[target.idx()].items.len();
         for i in 0..len {
             if self.players[target.idx()].items[i].active() {
@@ -871,7 +1104,7 @@ impl Battle {
                 self.record_reason(
                     EventTag::Freeze {
                         source,
-                        source_name: "白虎之力",
+                        source_name,
                         target,
                     },
                     1.0,
@@ -879,228 +1112,40 @@ impl Battle {
                 self.on_own_item_disabled(target);
             }
         }
-        self.on_freeze_triggered(source, "白虎之力");
+        self.on_freeze_triggered(source, source_name);
     }
 
     fn on_freeze_triggered(&mut self, side: Side, source_name: &'static str) {
-        if self.players[side.idx()].has("续命术") {
-            self.heal(side, 70.0, "续命术");
-        }
-        let quick_cells: Vec<Vec<(usize, usize)>> = self.players[side.idx()]
-            .items
-            .iter()
-            .filter(|i| i.def.short == "快意")
-            .map(|i| i.cells.clone())
-            .collect();
-        for cells in quick_cells {
-            let targets = self.adjacent_active_items(side, &cells, false);
-            for idx in targets {
-                self.accelerate_item(side, idx, 4.0, "快意魂玉");
-            }
-        }
-        if source_name == "冰魄" {
-            self.add_icepo_stack(side);
-        }
+        self.run_side_actions(side, "on_freeze_triggered");
+        self.run_source_actions(side, "on_freeze_source", source_name);
     }
 
     fn on_attack_hit(&mut self, side: Side) {
-        if self.players[side.idx()].has("破势") {
-            self.players[side.other().idx()].sword =
-                (self.players[side.other().idx()].sword - 12.0).max(0.0);
-        }
-        if self.players[side.idx()].has("锋锐") {
-            self.slow_random(side.other(), 4.0);
-        }
-        if self.players[side.idx()]
-            .items
-            .iter()
-            .any(|item| item.def.short == "缚命环" && item.used)
-        {
-            self.heal(side, 40.0, "缚命环命中治疗");
-        }
-        if let Some(idx) = self.find_first(side, "白虎之力") {
-            if !self.players[side.idx()].items[idx].used {
-                self.players[side.idx()].items[idx].used = true;
-                self.freeze_all(side, side.other(), 3.0);
-                self.add_weapon_attack(side, 100.0);
-            }
-        }
+        self.run_side_actions(side, "on_attack_hit");
     }
 
     fn on_normal_hit(&mut self, side: Side) {
-        let xu = self.find_first(side, "玄武");
-        if let Some(idx) = xu {
-            if !self.players[side.idx()].items[idx].used {
-                self.players[side.idx()].items[idx].used = true;
-                self.players[side.idx()].max_hp += 200.0;
-                self.record_reason(
-                    EventTag::StartMaxHp {
-                        side,
-                        source: "玄武之力",
-                    },
-                    200.0,
-                );
-                self.heal(side, 200.0, "玄武之力");
-                self.add_weapon_attack(side, 40.0);
-                self.accelerate_weapons(side, 3.0, "玄武之力");
-            }
-        }
-        if self.players[side.idx()].has("寒冰核") {
-            self.slow_random(side.other(), 1.0);
-        }
-        if self.players[side.idx()].has("催破") {
-            self.accelerate_random(side, 4.0, "催破魂玉");
-        }
+        self.run_side_actions(side, "on_normal_hit");
     }
 
     fn on_charged_hit(&mut self, side: Side) {
-        if self.players[side.idx()].has("振魄") {
-            self.players[side.idx()].sword += 20.0;
-            self.freeze_random(side, side.other(), 1, 1.0, 0.0, "振魄");
-        }
+        self.run_side_actions(side, "on_charged_hit");
     }
 
     fn on_heal(&mut self, side: Side) {
-        let len = self.players[side.idx()].items.len();
-        for i in 0..len {
-            match self.players[side.idx()].items[i].def.short {
-                "百战" => {
-                    if self.bump_stack(side, i, "百战", 10) {
-                        self.add_weapon_attack(side, 16.0);
-                    }
-                }
-                "吐纳" => {
-                    if self.bump_stack(side, i, "吐纳", 20) {
-                        let cells = self.players[side.idx()].items[i].cells.clone();
-                        for w in self.adjacent_weapons(side, &cells) {
-                            self.players[side.idx()].items[w].attack_bonus += 15.0;
-                        }
-                    }
-                }
-                "战神" => {
-                    let cells = self.players[side.idx()].items[i].cells.clone();
-                    for w in self.adjacent_weapons(side, &cells) {
-                        self.accelerate_item(side, w, 2.5, "战神魂玉");
-                    }
-                }
-                "凌波" => self.slow_random(side.other(), 4.0),
-                "铸盾" => self.players[side.idx()].armor += 45.0,
-                "烛神令" => self.players[side.idx()].items[i].progress += 1.0,
-                _ => {}
-            }
-        }
+        self.run_side_actions(side, "on_heal");
     }
 
     fn on_parry_success(&mut self, side: Side) {
-        if self.players[side.idx()].has("天响") {
-            self.charge_all_active(side, 1.5);
-        }
-        if self.players[side.idx()].has("混沌") {
-            self.accelerate_weapons(side, 4.0, "混沌魂玉");
-        }
+        self.run_side_actions(side, "on_parry_success");
     }
 
     fn on_own_item_disabled(&mut self, side: Side) {
-        let count = self.players[side.idx()]
-            .items
-            .iter()
-            .filter(|i| i.def.short == "神将甲")
-            .count();
-        for _ in 0..count {
-            self.players[side.idx()].armor += 15.0;
-            self.record_reason(
-                EventTag::ArmorGain {
-                    side,
-                    source: "神将甲",
-                },
-                15.0,
-            );
-            self.heal(side, 15.0, "神将甲");
-        }
+        self.run_side_actions(side, "on_own_item_disabled");
     }
 
     fn apply_battle_start(&mut self, side: Side) {
-        let len = self.players[side.idx()].items.len();
-        for i in 0..len {
-            match self.players[side.idx()].items[i].def.short {
-                "百战" => {
-                    self.players[side.idx()].max_hp += 180.0;
-                    self.players[side.idx()].hp += 180.0;
-                    self.record_reason(
-                        EventTag::StartMaxHp {
-                            side,
-                            source: "百战魂玉",
-                        },
-                        180.0,
-                    );
-                }
-                "天响" => {
-                    self.players[side.idx()].sword += 22.0;
-                    self.record_reason(
-                        EventTag::StartSword {
-                            side,
-                            source: "天响魂玉",
-                        },
-                        22.0,
-                    );
-                }
-                "通达" => self.accelerate_all_active(side, 2.0, "通达魂玉"),
-                "穿颅" => {
-                    self.accelerate_weapons(side, 6.0, "穿颅魂玉");
-                    let cells = self.players[side.idx()].items[i].cells.clone();
-                    let targets = self.adjacent_active_items(side, &cells, false);
-                    for idx in targets {
-                        self.players[side.idx()].items[idx].progress += 3.0;
-                        self.record_reason(
-                            EventTag::Charge {
-                                side,
-                                source: "穿颅魂玉",
-                            },
-                            3.0,
-                        );
-                    }
-                }
-                "神将甲" => {
-                    self.players[side.idx()].armor += 300.0;
-                    self.players[side.idx()].damage_reduction += 0.05;
-                    self.record_reason(
-                        EventTag::StartArmor {
-                            side,
-                            source: "神将甲护甲",
-                        },
-                        300.0,
-                    );
-                    self.record_reason(
-                        EventTag::StartReduction {
-                            side,
-                            source: "神将甲减伤",
-                        },
-                        5.0,
-                    );
-                }
-                "振魄" | "混沌" => {
-                    self.players[side.idx()].sword += 20.0;
-                    self.record_reason(
-                        EventTag::StartSword {
-                            side,
-                            source: self.players[side.idx()].items[i].def.full,
-                        },
-                        20.0,
-                    );
-                }
-                "烛神令" => {
-                    self.players[side.idx()].sword += 20.0;
-                    self.record_reason(
-                        EventTag::StartSword {
-                            side,
-                            source: "烛神令",
-                        },
-                        20.0,
-                    );
-                }
-                _ => {}
-            }
-        }
+        self.run_side_actions(side, "battle_start");
     }
 
     fn bump_stack(&mut self, side: Side, idx: usize, key: &'static str, max: u32) -> bool {
@@ -1114,29 +1159,83 @@ impl Battle {
         }
     }
 
-    fn add_icepo_stack(&mut self, side: Side) {
-        let cur = self.players[side.idx()]
-            .items
-            .iter()
-            .find(|i| i.def.short == "冰魄")
-            .and_then(|i| i.stacks.get("冰魄全局"))
-            .copied()
-            .unwrap_or(0);
-        if cur >= 7 {
+    // 该联动按“同来源装备组”共享层数，避免同名来源各算各的。
+    fn add_freeze_attack_stack(&mut self, side: Side, item_idx: usize, action: &ActionSpec) {
+        let max_stacks = action.count.unwrap_or(0).max(0) as u32;
+        if max_stacks == 0 {
             return;
         }
-        for item in &mut self.players[side.idx()].items {
-            if item.def.short == "冰魄" {
-                item.stacks.insert("冰魄全局", cur + 1);
-            }
+        let source = leak_runtime_text(action.source_text.clone());
+        if !self.is_first_source_action_item(
+            side,
+            item_idx,
+            "on_freeze_source",
+            &action.action,
+            source,
+        ) {
+            return;
         }
-        let amount = self.players[side.idx()]
-            .items
-            .iter()
-            .filter(|i| i.def.short == "冰魄")
-            .map(|i| i.freeze_attack_bonus(35.0))
+        let cur = self
+            .matching_source_action_items(side, "on_freeze_source", &action.action, source)
+            .into_iter()
+            .filter_map(|idx| {
+                self.players[side.idx()].items[idx]
+                    .stacks
+                    .get(source)
+                    .copied()
+            })
+            .max()
+            .unwrap_or(0);
+        if cur >= max_stacks {
+            return;
+        }
+        let matching =
+            self.matching_source_action_items(side, "on_freeze_source", &action.action, source);
+        for idx in &matching {
+            self.players[side.idx()].items[*idx]
+                .stacks
+                .insert(source, cur + 1);
+        }
+        let amount = matching
+            .into_iter()
+            .map(|idx| self.players[side.idx()].items[idx].freeze_attack_bonus(35.0))
             .fold(35.0, f64::max);
         self.add_weapon_attack(side, amount);
+    }
+
+    fn is_first_source_action_item(
+        &self,
+        side: Side,
+        item_idx: usize,
+        trigger: &str,
+        action_name: &str,
+        source: &'static str,
+    ) -> bool {
+        self.matching_source_action_items(side, trigger, action_name, source)
+            .first()
+            .is_some_and(|first| *first == item_idx)
+    }
+
+    fn matching_source_action_items(
+        &self,
+        side: Side,
+        trigger: &str,
+        action_name: &str,
+        source: &'static str,
+    ) -> Vec<usize> {
+        self.players[side.idx()]
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                item.actions_by_trigger.get(trigger).is_some_and(|actions| {
+                    actions
+                        .iter()
+                        .any(|action| action.action == action_name && action.source_text == source)
+                })
+            })
+            .map(|(idx, _)| idx)
+            .collect()
     }
 
     fn add_weapon_attack(&mut self, side: Side, amount: f64) {
@@ -1189,46 +1288,16 @@ impl Battle {
     }
 
     fn on_accelerated(&mut self, side: Side, target_idx: usize) {
-        let target_cells = self.players[side.idx()].items[target_idx].cells.clone();
-        let tongda: Vec<usize> = self.players[side.idx()]
-            .items
-            .iter()
-            .enumerate()
-            .filter(|(_, i)| i.def.short == "通达")
-            .map(|(i, _)| i)
-            .collect();
-        for idx in tongda {
-            if adjacent(&self.players[side.idx()].items[idx].cells, &target_cells)
-                && self.bump_stack(side, idx, "通达", 20)
-            {
-                let cells = self.players[side.idx()].items[idx].cells.clone();
-                for w in self.adjacent_weapons(side, &cells) {
-                    self.players[side.idx()].items[w].attack_bonus += 18.0;
-                }
-                self.record_reason(
-                    EventTag::AttackBoost {
-                        side,
-                        source: "通达魂玉",
-                    },
-                    18.0,
-                );
-            }
-        }
+        self.run_side_actions_with_context(side, "on_accelerated", target_idx);
     }
 
-    fn charge_all_active(&mut self, side: Side, amount: f64) {
+    fn charge_all_active(&mut self, side: Side, amount: f64, source: &'static str) {
         for item in &mut self.players[side.idx()].items {
             if item.active() {
                 item.progress += amount;
             }
         }
-        self.record_reason(
-            EventTag::Charge {
-                side,
-                source: "所有读条装备充能",
-            },
-            amount,
-        );
+        self.record_reason(EventTag::Charge { side, source }, amount);
     }
 
     fn charge_random(&mut self, side: Side, amount: f64) {
@@ -1266,7 +1335,7 @@ impl Battle {
         }
     }
 
-    fn slow_random(&mut self, side: Side, duration: f64) {
+    fn slow_random(&mut self, side: Side, duration: f64, source: &'static str) {
         let active: Vec<usize> = self.players[side.idx()]
             .items
             .iter()
@@ -1279,13 +1348,7 @@ impl Battle {
             self.players[side.idx()].items[idx].slowed_until = self.players[side.idx()].items[idx]
                 .slowed_until
                 .max(self.nowish() + duration);
-            self.record_reason(
-                EventTag::Slow {
-                    side,
-                    source: "减速",
-                },
-                1.0,
-            );
+            self.record_reason(EventTag::Slow { side, source }, 1.0);
         }
     }
 
@@ -1314,13 +1377,6 @@ impl Battle {
             })
             .map(|(i, _)| i)
             .collect()
-    }
-
-    fn find_first(&self, side: Side, short: &str) -> Option<usize> {
-        self.players[side.idx()]
-            .items
-            .iter()
-            .position(|i| i.def.short == short)
     }
 
     fn nowish(&self) -> f64 {
@@ -1482,15 +1538,7 @@ fn damage_event_text(attacker: Side, cause: &'static str) -> String {
         Side::Me => "你",
         Side::Enemy => "敌方",
     };
-    let action = match cause {
-        "龙弧蓄力攻击" => "龙弧 蓄力命中",
-        "龙弧普通攻击" => "龙弧 普攻命中",
-        "烛神令蓄力攻击" => "烛神令 蓄力命中",
-        "烛神令普通攻击" => "烛神令 普攻命中",
-        "冰魄普通攻击" => "冰魄 普攻命中",
-        other => other,
-    };
-    format!("{side} {action}")
+    format!("{side} {cause}")
 }
 
 fn parry_event_text(defender: Side, attacker: Side) -> String {
@@ -1711,7 +1759,7 @@ fn parse_input(
 ) -> Result<([[String; WIDTH]; HEIGHT], [[String; WIDTH]; HEIGHT]), String> {
     let mut sections: [Vec<Vec<String>>; 2] = [Vec::new(), Vec::new()];
     let mut cur: Option<usize> = None;
-    let all_defs = defs();
+    let all_defs = defs()?;
     let names: Vec<&str> = all_defs.iter().map(|d| d.short).collect();
 
     for line in text.lines() {
@@ -1746,6 +1794,7 @@ fn parse_input(
     Ok((to_grid(&sections[0]), to_grid(&sections[1])))
 }
 
+// 行解析同时兼容表格、空格分隔和“装备名+星级数字”的写法。
 fn parse_row(line: &str, names: &[&str]) -> Vec<String> {
     let mut s = line.replace('\t', " ");
     if let Some(pos) = s.find('行') {
@@ -1802,7 +1851,7 @@ fn normalize_label(token: &str, names: &[&str]) -> Option<String> {
             continue;
         };
         if !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_digit()) {
-            return Some(token.to_string());
+            return Some(format!("{name}{rest}"));
         }
     }
     None
@@ -1812,8 +1861,9 @@ fn to_grid(rows: &[Vec<String>]) -> [[String; WIDTH]; HEIGHT] {
     std::array::from_fn(|r| std::array::from_fn(|c| rows[r][c].clone()))
 }
 
+// 输入的是背包格子图，这里把它切分成装备实例并挂上数据库动作。
 fn build_items(grid: &[[String; WIDTH]; HEIGHT]) -> Result<Vec<Item>, String> {
-    let all_defs = defs();
+    let all_defs = defs()?;
     let mut by_name = HashMap::new();
     for def in &all_defs {
         by_name.insert(def.short, *def);
@@ -1831,13 +1881,18 @@ fn build_items(grid: &[[String; WIDTH]; HEIGHT]) -> Result<Vec<Item>, String> {
             let def = *by_name
                 .get(name)
                 .ok_or_else(|| format!("未知装备词条: {name}"))?;
-            let star_profile = match star {
-                Some(value) => Some(
+            let supports_star = equipment::supports_star(name);
+            let star = Some(if supports_star { star.unwrap_or(4) } else { 4 });
+            let star_profile = if supports_star {
+                let value = star.expect("star is normalized above");
+                Some(
                     equipment::star_profile(name, value)
                         .ok_or_else(|| format!("{name} 暂未写入 {value} 星属性，无法按星级模拟"))?,
-                ),
-                None => None,
+                )
+            } else {
+                None
             };
+            let actions_by_trigger = equipment::all_actions(name)?;
             let comp = component(grid, &mut seen, r, c);
             let pieces = tile_component(&comp, def).ok_or_else(|| {
                 format!(
@@ -1852,6 +1907,7 @@ fn build_items(grid: &[[String; WIDTH]; HEIGHT]) -> Result<Vec<Item>, String> {
                     def,
                     _star: star,
                     star_profile,
+                    actions_by_trigger: actions_by_trigger.clone(),
                     cells,
                     attack_bonus: 0.0,
                     progress: 0.0,
@@ -1867,6 +1923,7 @@ fn build_items(grid: &[[String; WIDTH]; HEIGHT]) -> Result<Vec<Item>, String> {
     Ok(out)
 }
 
+// 支持像“冰魄2”这样的写法；没写星级时后面统一默认按 4 星。
 fn split_star_label<'a>(
     label: &'a str,
     by_name: &HashMap<&'static str, Def>,
@@ -1886,13 +1943,14 @@ fn split_star_label<'a>(
             .parse::<u8>()
             .map_err(|_| format!("{label} 的星级数字无效"))?;
         if !(1..=4).contains(&star) {
-            return Err(format!("{label} 的星级必须是 1/2/3/4"));
+            return Err(format!("{label} 的星级需在 1 到 4 之间"));
         }
         return Ok((name, Some(star)));
     }
     Err(format!("未知装备词条: {label}"))
 }
 
+// 先按连通块找到同名格子，再尝试切成装备形状。
 fn component(
     grid: &[[String; WIDTH]; HEIGHT],
     seen: &mut [[bool; WIDTH]; HEIGHT],
@@ -1932,12 +1990,13 @@ fn neighbors(r: usize, c: usize) -> Vec<(usize, usize)> {
     v
 }
 
+// 同一个连通块可能代表多件同名装备，这里按占格递归切分。
 fn tile_component(comp: &[(usize, usize)], def: Def) -> Option<Vec<Vec<(usize, usize)>>> {
-    if def.w == 1 && def.h == 1 {
-        return Some(comp.iter().map(|&cell| vec![cell]).collect());
-    }
     let mut cells = comp.to_vec();
     cells.sort();
+    if def.w == 1 && def.h == 1 {
+        return Some(cells.into_iter().map(|cell| vec![cell]).collect());
+    }
     let shapes = if def.w == def.h {
         vec![(def.h, def.w)]
     } else {
@@ -1982,6 +2041,7 @@ fn backtrack_tile(
     None
 }
 
+// 相邻判定只看上下左右，不看斜角。
 fn adjacent(a: &[(usize, usize)], b: &[(usize, usize)]) -> bool {
     for &(ar, ac) in a {
         for &(br, bc) in b {
@@ -1996,6 +2056,7 @@ fn adjacent(a: &[(usize, usize)], b: &[(usize, usize)]) -> bool {
     false
 }
 
+// 内置样例主要用于快速回归，不参与正式逻辑判断。
 fn sample_input() -> &'static str {
     r#"
 现在用我这套：
@@ -2017,3 +2078,15 @@ fn sample_input() -> &'static str {
 第5行	冰魄 烛神令 烛神令 烛神令
 "#
 }
+
+fn leak_runtime_text(value: String) -> &'static str {
+    Box::leak(value.into_boxed_str())
+}
+
+
+
+
+
+
+
+
