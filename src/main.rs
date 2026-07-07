@@ -132,6 +132,10 @@ struct Player {
     max_hp: f64,
     armor: f64,
     damage_reduction: f64,
+    crit_chance: f64,
+    burn_stacks: f64,
+    poison_stacks: f64,
+    status_tick_accum: f64,
     sword: f64,
     stagger_until: f64,
 }
@@ -349,6 +353,14 @@ impl Rng {
     fn bool(&mut self) -> bool {
         self.next_u64() & 1 == 1
     }
+
+    fn chance(&mut self, probability: f64) -> bool {
+        if probability <= 0.0 {
+            return false;
+        }
+        let roll = self.next_u64() as f64 / u64::MAX as f64;
+        roll < probability.clamp(0.0, 1.0)
+    }
 }
 
 fn main() {
@@ -466,6 +478,11 @@ impl Battle {
             if step == steps {
                 break;
             }
+            self.tick_status_effects();
+            if self.players[0].hp <= 0.0 || self.players[1].hp <= 0.0 {
+                self.fill_remaining_hp(step + 1, steps);
+                break;
+            }
             if self.rng.bool() {
                 self.tick_side(Side::Me, t);
                 self.tick_side(Side::Enemy, t);
@@ -554,44 +571,55 @@ impl Battle {
         item_idx: usize,
         sword_gain: f64,
         source: &'static str,
-        freezes_after_hit: bool,
+        freeze_count: usize,
+        freeze_duration: f64,
+        multi_trigger: usize,
     ) {
-        let dmg = self.players[side.idx()].items[item_idx].attack();
-        let cause = if freezes_after_hit {
-            leak_runtime_text(format!("{source} 普攻命中并继续冻结"))
-        } else {
-            leak_runtime_text(format!("{source} 普攻命中"))
-        };
-        self.deal_damage(side, dmg, cause);
-        self.count_attack(side);
+        let hits = multi_trigger.max(1);
+        for _ in 0..hits {
+            let dmg = self.players[side.idx()].items[item_idx].attack();
+            let cause = if freeze_count > 0 {
+                leak_runtime_text(format!("{source} 普攻命中并继续冻结"))
+            } else {
+                leak_runtime_text(format!("{source} 普攻命中"))
+            };
+            self.deal_damage(side, dmg, cause);
+            self.count_attack(side);
+            self.on_attack_hit(side);
+            self.on_normal_hit(side);
+        }
         self.players[side.idx()].sword += sword_gain;
         self.run_side_actions(side, "on_normal_attack");
-        self.on_attack_hit(side);
-        self.on_normal_hit(side);
-        if freezes_after_hit {
-            self.freeze_random(side, side.other(), 2, 2.0, 0.0, source);
+        if freeze_count > 0 && freeze_duration > 0.0 {
+            self.freeze_random(side, side.other(), freeze_count, freeze_duration, 0.0, source);
         }
     }
 
-    fn longhu_attack(&mut self, side: Side, item_idx: usize, source: &'static str) {
-        if self.players[side.idx()].sword >= 28.0 {
-            self.players[side.idx()].sword -= 28.0;
+    fn longhu_attack(&mut self, side: Side, item_idx: usize, action: &ActionSpec, source: &'static str) {
+        let sword_cost = effect_value(action, "charged_sword_cost", 28.0);
+        if self.players[side.idx()].sword >= sword_cost {
+            self.players[side.idx()].sword -= sword_cost;
             if self.try_parry(side) {
                 return;
             }
             self.count_attack(side);
-            let dmg = self.players[side.idx()].items[item_idx].attack() * 3.7;
+            let dmg = self.players[side.idx()].items[item_idx].attack()
+                * effect_value(action, "charged_damage_multiplier", 3.7);
             self.deal_damage(side, dmg, leak_runtime_text(format!("{source} 蓄力命中")));
             let enemy_sword_loss =
-                self.players[side.idx()].items[item_idx].charged_enemy_sword_loss(16.0);
+                self.players[side.idx()].items[item_idx]
+                    .charged_enemy_sword_loss(effect_value(action, "charged_enemy_sword_loss", 16.0));
             self.players[side.other().idx()].sword =
                 (self.players[side.other().idx()].sword - enemy_sword_loss).max(0.0);
             self.on_attack_hit(side);
             self.on_charged_hit(side);
-            self.freeze_random(side, side.other(), 1, 2.0, 0.0, source);
+            let freeze_count = effect_value(action, "freeze_count", 1.0).max(0.0) as usize;
+            let freeze_duration = effect_value(action, "freeze_duration", 2.0);
+            self.freeze_random(side, side.other(), freeze_count, freeze_duration, 0.0, source);
         } else {
-            let sword_gain = self.players[side.idx()].items[item_idx].normal_sword_gain(16.0);
-            self.normal_attack(side, item_idx, sword_gain, source, false);
+            let sword_gain = self.players[side.idx()].items[item_idx]
+                .normal_sword_gain(effect_value(action, "normal_sword", 16.0));
+            self.normal_attack(side, item_idx, sword_gain, source, 0, 0.0, 1);
         }
     }
 
@@ -672,11 +700,32 @@ impl Battle {
         let target_side = self.action_target_side(side, &action.target);
         match action.action.as_str() {
             "freezing_normal_weapon_attack" => {
-                let sword_gain = self.players[side.idx()].items[item_idx].normal_sword_gain(16.0);
-                self.normal_attack(side, item_idx, sword_gain, source, true);
+                let sword_gain = self.players[side.idx()].items[item_idx]
+                    .normal_sword_gain(effect_value(action, "normal_sword", 16.0));
+                let freeze_count = effect_value(
+                    action,
+                    "freeze_count",
+                    action.count.unwrap_or(2).max(0) as f64,
+                )
+                .max(0.0) as usize;
+                let freeze_duration =
+                    effect_value(action, "freeze_duration", action.duration.unwrap_or(2.0));
+                let multi_trigger =
+                    effect_value(action, "multi_trigger", action.amount.unwrap_or(1.0))
+                        .max(1.0)
+                        .round() as usize;
+                self.normal_attack(
+                    side,
+                    item_idx,
+                    sword_gain,
+                    source,
+                    freeze_count,
+                    freeze_duration,
+                    multi_trigger,
+                );
             }
-            "charged_sword_control_weapon_attack" => self.longhu_attack(side, item_idx, source),
-            "charged_healing_weapon_attack" => self.zhushenling_attack(side, item_idx, source),
+            "charged_sword_control_weapon_attack" => self.longhu_attack(side, item_idx, action, source),
+            "charged_healing_weapon_attack" => self.zhushenling_attack(side, item_idx, action, source),
             "add_freeze_attack_stack" => self.add_freeze_attack_stack(side, item_idx, action),
             "freeze_random" => {
                 let count = action.count.unwrap_or(1).max(0) as usize;
@@ -768,6 +817,15 @@ impl Battle {
                     amount * 100.0,
                 );
             }
+            "crit_chance" => {
+                self.players[target_side.idx()].crit_chance += amount;
+            }
+            "burn" => {
+                self.players[target_side.idx()].burn_stacks += amount;
+            }
+            "poison" => {
+                self.players[target_side.idx()].poison_stacks += amount;
+            }
             "add_weapon_attack" => self.add_weapon_attack(target_side, amount),
             "add_weapon_attack_stacking" => {
                 let max_stacks = action.count.unwrap_or(0).max(0) as u32;
@@ -842,16 +900,22 @@ impl Battle {
             _ => {}
         }
     }
-    fn zhushenling_attack(&mut self, side: Side, item_idx: usize, source: &'static str) {
-        if self.players[side.idx()].sword >= 24.0 {
-            self.players[side.idx()].sword -= 24.0;
+    fn zhushenling_attack(&mut self, side: Side, item_idx: usize, action: &ActionSpec, source: &'static str) {
+        let sword_cost = effect_value(action, "charged_sword_cost", 24.0);
+        if self.players[side.idx()].sword >= sword_cost {
+            self.players[side.idx()].sword -= sword_cost;
             if self.try_parry(side) {
                 return;
             }
             self.count_attack(side);
-            let dmg = self.players[side.idx()].items[item_idx].attack() * 2.25;
+            let dmg = self.players[side.idx()].items[item_idx].attack()
+                * effect_value(action, "charged_damage_multiplier", 2.25);
             self.deal_damage(side, dmg, leak_runtime_text(format!("{source} 蓄力命中")));
-            self.heal(side, 4.0, leak_runtime_text(format!("{source}生命恢复")));
+            self.heal(
+                side,
+                effect_value(action, "charged_heal", 4.0),
+                leak_runtime_text(format!("{source}生命恢复")),
+            );
             self.on_attack_hit(side);
             self.on_charged_hit(side);
         } else {
@@ -859,8 +923,13 @@ impl Battle {
             let dmg = self.players[side.idx()].items[item_idx].attack();
             self.deal_damage(side, dmg, leak_runtime_text(format!("{source} 普攻命中")));
             self.players[side.idx()].sword +=
-                self.players[side.idx()].items[item_idx].normal_sword_gain(14.0);
-            self.heal(side, 4.0, leak_runtime_text(format!("{source}生命恢复")));
+                self.players[side.idx()].items[item_idx]
+                    .normal_sword_gain(effect_value(action, "normal_sword", 14.0));
+            self.heal(
+                side,
+                effect_value(action, "normal_heal", 4.0),
+                leak_runtime_text(format!("{source}生命恢复")),
+            );
             self.on_attack_hit(side);
             self.on_normal_hit(side);
         }
@@ -903,10 +972,17 @@ impl Battle {
         }
     }
 
-    // 先吃减伤，再走护甲，最后才扣生命。
+    // 先判暴击，再吃减伤，再走护甲，最后才扣生命。
     fn deal_damage(&mut self, attacker: Side, raw: f64, cause: &'static str) {
         let defender = attacker.other();
         let pending_hit_preview_source = self.pending_hit_preview_source(attacker);
+        let is_crit = self.rng.chance(self.players[attacker.idx()].crit_chance);
+        let raw = if is_crit { raw * 2.0 } else { raw };
+        let cause = if is_crit {
+            leak_runtime_text(format!("{cause}（暴击）"))
+        } else {
+            cause
+        };
         let p = &mut self.players[defender.idx()];
         let dmg = raw * (1.0 - p.damage_reduction);
         let from_armor = p.armor.min(dmg);
@@ -934,6 +1010,93 @@ impl Battle {
                 cause,
                 hp_loss,
                 pending_hit_preview_source,
+            );
+        }
+        if from_armor > 0.0 {
+            self.record_reason(
+                EventTag::ArmorAbsorb {
+                    attacker,
+                    source: cause,
+                    target: defender,
+                },
+                from_armor,
+            );
+        }
+        self.run_side_actions(defender, "on_damaged");
+        if is_crit {
+            self.on_crit(attacker);
+        }
+    }
+
+    fn tick_status_effects(&mut self) {
+        for side in [Side::Me, Side::Enemy] {
+            self.players[side.idx()].status_tick_accum += DT;
+            while self.players[side.idx()].status_tick_accum + 1e-9 >= 1.0 {
+                self.players[side.idx()].status_tick_accum -= 1.0;
+                self.apply_burn_tick(side);
+                self.apply_poison_tick(side);
+            }
+        }
+    }
+
+    fn apply_burn_tick(&mut self, defender: Side) {
+        let stacks = self.players[defender.idx()].burn_stacks;
+        if stacks <= 0.0 {
+            return;
+        }
+        self.deal_status_damage(defender.other(), defender, stacks, "灼伤", false);
+        self.players[defender.idx()].burn_stacks *= 0.9;
+    }
+
+    fn apply_poison_tick(&mut self, defender: Side) {
+        let stacks = self.players[defender.idx()].poison_stacks;
+        if stacks <= 0.0 {
+            return;
+        }
+        self.deal_status_damage(defender.other(), defender, stacks, "中毒", true);
+    }
+
+    fn deal_status_damage(
+        &mut self,
+        attacker: Side,
+        defender: Side,
+        amount: f64,
+        cause: &'static str,
+        ignore_armor: bool,
+    ) {
+        let p = &mut self.players[defender.idx()];
+        let from_armor = if ignore_armor {
+            0.0
+        } else {
+            p.armor.min(amount)
+        };
+        p.armor -= from_armor;
+        let hp_loss = amount - from_armor;
+        p.hp -= hp_loss;
+        let b = self.cur_bucket();
+        if attacker == Side::Me {
+            self.events[b].damage_me_to_enemy += amount;
+        } else {
+            self.events[b].damage_enemy_to_me += amount;
+        }
+        if hp_loss > 0.0 {
+            self.record_reason(
+                EventTag::Damage {
+                    attacker,
+                    source: cause,
+                    target: defender,
+                },
+                hp_loss,
+            );
+            let lethal_side = if self.players[defender.idx()].hp <= 0.0 {
+                Some(defender)
+            } else {
+                None
+            };
+            self.record_timeline_event(
+                damage_event_text(attacker, cause),
+                Some(hp_loss),
+                lethal_side,
             );
         }
         if from_armor > 0.0 {
@@ -1122,6 +1285,10 @@ impl Battle {
 
     fn on_attack_hit(&mut self, side: Side) {
         self.run_side_actions(side, "on_attack_hit");
+    }
+
+    fn on_crit(&mut self, side: Side) {
+        self.run_side_actions(side, "on_crit");
     }
 
     fn on_normal_hit(&mut self, side: Side) {
@@ -1405,6 +1572,10 @@ fn new_player(items: Vec<Item>) -> Player {
         max_hp: 1000.0,
         armor: 0.0,
         damage_reduction: 0.0,
+        crit_chance: 0.0,
+        burn_stacks: 0.0,
+        poison_stacks: 0.0,
+        status_tick_accum: 0.0,
         sword: 0.0,
         stagger_until: 0.0,
     }
@@ -1892,7 +2063,8 @@ fn build_items(grid: &[[String; WIDTH]; HEIGHT]) -> Result<Vec<Item>, String> {
             } else {
                 None
             };
-            let actions_by_trigger = equipment::all_actions(name)?;
+            let action_star = star.expect("star is normalized above");
+            let actions_by_trigger = equipment::all_actions(name, action_star)?;
             let comp = component(grid, &mut seen, r, c);
             let pieces = tile_component(&comp, def).ok_or_else(|| {
                 format!(
@@ -2083,10 +2255,6 @@ fn leak_runtime_text(value: String) -> &'static str {
     Box::leak(value.into_boxed_str())
 }
 
-
-
-
-
-
-
-
+fn effect_value(action: &ActionSpec, key: &str, fallback: f64) -> f64 {
+    action.effects.get(key).copied().unwrap_or(fallback)
+}

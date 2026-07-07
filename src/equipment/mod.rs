@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -26,6 +26,15 @@ pub struct ActionSpec {
     pub duration: Option<f64>,
     pub count: Option<i64>,
     pub source_text: String,
+    pub effects: HashMap<String, f64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ActionKey {
+    trigger: String,
+    action: String,
+    target: String,
+    sort_order: i64,
 }
 
 const DB_FILE: &str = "equipment.sqlite";
@@ -89,40 +98,112 @@ pub fn star_profile(short: &str, star: u8) -> Option<StarProfile> {
 }
 
 // 一次性读出某件装备的全部触发动作，运行期不再频繁查库。
-pub fn all_actions(short: &str) -> Result<HashMap<String, Vec<ActionSpec>>, String> {
+pub fn all_actions(short: &str, star: u8) -> Result<HashMap<String, Vec<ActionSpec>>, String> {
     let mut conn = open_equipment_db()?;
     sync_catalog(&mut conn)?;
 
     let mut stmt = conn
         .prepare(
-            "SELECT trigger, action, target, amount, duration, count, source_text
+            "SELECT star, trigger, action, target, amount, duration, count, source_text, sort_order
              FROM equipment_actions
-             WHERE equipment_short = ?1
-             ORDER BY trigger, sort_order",
+             WHERE equipment_short = ?1 AND star IN (0, ?2)
+             ORDER BY star, trigger, sort_order",
         )
         .map_err(|err| format!("读取装备行为失败: {err}"))?;
     let rows = stmt
-        .query_map(params![short], |row| {
+        .query_map(params![short, star as i64], |row| {
+            let trigger = row.get::<_, String>(1)?;
+            let action = row.get::<_, String>(2)?;
+            let target = row.get::<_, String>(3)?;
+            let sort_order = row.get::<_, i64>(8)?;
             Ok((
-                row.get::<_, String>(0)?,
+                ActionKey {
+                    trigger,
+                    action: action.clone(),
+                    target: target.clone(),
+                    sort_order,
+                },
+                row.get::<_, i64>(0)?,
                 ActionSpec {
-                    action: row.get(1)?,
-                    target: row.get(2)?,
-                    amount: row.get(3)?,
-                    duration: row.get(4)?,
-                    count: row.get(5)?,
-                    source_text: row.get(6)?,
+                    action,
+                    target,
+                    amount: row.get(4)?,
+                    duration: row.get(5)?,
+                    count: row.get(6)?,
+                    source_text: row.get(7)?,
+                    effects: HashMap::new(),
                 },
             ))
         })
         .map_err(|err| format!("读取装备行为失败: {err}"))?;
 
-    let mut out: HashMap<String, Vec<ActionSpec>> = HashMap::new();
+    let mut merged: BTreeMap<ActionKey, (i64, ActionSpec)> = BTreeMap::new();
     for row in rows {
-        let (trigger, action) = row.map_err(|err| format!("解析装备行为失败: {err}"))?;
-        out.entry(trigger).or_default().push(action);
+        let (key, action_star, action) = row.map_err(|err| format!("解析装备行为失败: {err}"))?;
+        let replace = merged
+            .get(&key)
+            .is_none_or(|(existing_star, _)| action_star >= *existing_star);
+        if replace {
+            merged.insert(key, (action_star, action));
+        }
+    }
+
+    let mut out: HashMap<String, Vec<ActionSpec>> = HashMap::new();
+    for (key, (_, mut action)) in merged {
+        action.effects = load_action_effects(&conn, short, star as i64, &key)?;
+        out.entry(key.trigger).or_default().push(action);
     }
     Ok(out)
+}
+
+fn load_action_effects(
+    conn: &Connection,
+    short: &str,
+    star: i64,
+    key: &ActionKey,
+) -> Result<HashMap<String, f64>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT star, effect_key, value
+             FROM equipment_action_effects
+             WHERE equipment_short = ?1
+               AND star IN (0, ?2)
+               AND trigger = ?3
+               AND action = ?4
+               AND target = ?5
+               AND sort_order = ?6
+             ORDER BY star",
+        )
+        .map_err(|err| format!("读取动作效果参数失败: {err}"))?;
+    let rows = stmt
+        .query_map(
+            params![
+                short,
+                star,
+                key.trigger,
+                key.action,
+                key.target,
+                key.sort_order
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, f64>(2)?)),
+        )
+        .map_err(|err| format!("读取动作效果参数失败: {err}"))?;
+
+    let mut out: HashMap<String, (i64, f64)> = HashMap::new();
+    for row in rows {
+        let (effect_star, effect_key, value) =
+            row.map_err(|err| format!("解析动作效果参数失败: {err}"))?;
+        let replace = out
+            .get(&effect_key)
+            .is_none_or(|(existing_star, _)| effect_star >= *existing_star);
+        if replace {
+            out.insert(effect_key, (effect_star, value));
+        }
+    }
+    Ok(out
+        .into_iter()
+        .map(|(effect_key, (_, value))| (effect_key, value))
+        .collect())
 }
 
 // 判断某件装备是否存在可选星级档位。
@@ -161,6 +242,8 @@ fn sync_catalog(conn: &mut Connection) -> Result<(), String> {
         "properties_text",
         "ALTER TABLE equipment_star_profiles ADD COLUMN properties_text TEXT",
     )?;
+    ensure_equipment_actions_schema(conn)?;
+    create_action_effects_schema(conn)?;
 
     let tx = conn
         .transaction()
@@ -175,7 +258,7 @@ fn sync_catalog(conn: &mut Connection) -> Result<(), String> {
 
         tx.execute(
             "UPDATE attribute_terms
-             SET description = COALESCE(NULLIF(description, ''), ?1)
+             SET description = ?1
              WHERE term = ?2",
             params![term.description, term.term],
         )
@@ -304,8 +387,8 @@ fn sync_catalog(conn: &mut Connection) -> Result<(), String> {
     for action in catalog::EQUIPMENT_ACTIONS {
         tx.execute(
             "INSERT OR IGNORE INTO equipment_actions
-             (equipment_short, trigger, action, target, amount, duration, count, source_text, sort_order)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (equipment_short, star, trigger, action, target, amount, duration, count, source_text, sort_order)
+             VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 action.equipment_short,
                 action.trigger,
@@ -367,6 +450,7 @@ fn create_base_schema(conn: &Connection) -> Result<(), String> {
         );
         CREATE TABLE IF NOT EXISTS equipment_actions (
             equipment_short TEXT NOT NULL,
+            star INTEGER NOT NULL DEFAULT 0,
             trigger TEXT NOT NULL,
             action TEXT NOT NULL,
             target TEXT NOT NULL,
@@ -375,7 +459,20 @@ fn create_base_schema(conn: &Connection) -> Result<(), String> {
             count INTEGER,
             source_text TEXT NOT NULL,
             sort_order INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (equipment_short, trigger, action, target, sort_order),
+            PRIMARY KEY (equipment_short, star, trigger, action, target, sort_order),
+            FOREIGN KEY (equipment_short) REFERENCES equipment(short) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS equipment_action_effects (
+            equipment_short TEXT NOT NULL,
+            star INTEGER NOT NULL DEFAULT 0,
+            trigger TEXT NOT NULL,
+            action TEXT NOT NULL,
+            target TEXT NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            effect_key TEXT NOT NULL,
+            value REAL NOT NULL,
+            unit TEXT,
+            PRIMARY KEY (equipment_short, star, trigger, action, target, sort_order, effect_key),
             FOREIGN KEY (equipment_short) REFERENCES equipment(short) ON DELETE CASCADE
         );
         CREATE VIEW IF NOT EXISTS equipment_star_manual_view AS
@@ -441,6 +538,77 @@ fn ensure_equipment_columns(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+fn create_action_effects_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS equipment_action_effects (
+            equipment_short TEXT NOT NULL,
+            star INTEGER NOT NULL DEFAULT 0,
+            trigger TEXT NOT NULL,
+            action TEXT NOT NULL,
+            target TEXT NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            effect_key TEXT NOT NULL,
+            value REAL NOT NULL,
+            unit TEXT,
+            PRIMARY KEY (equipment_short, star, trigger, action, target, sort_order, effect_key),
+            FOREIGN KEY (equipment_short) REFERENCES equipment(short) ON DELETE CASCADE
+        );",
+    )
+    .map_err(|err| format!("初始化动作效果参数表失败: {err}"))
+}
+
+fn ensure_equipment_actions_schema(conn: &Connection) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(equipment_actions)")
+        .map_err(|err| format!("读取装备行为表结构失败: {err}"))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|err| format!("读取装备行为表结构失败: {err}"))?;
+    let mut has_star = false;
+    while let Some(row) = rows
+        .next()
+        .map_err(|err| format!("读取装备行为表结构失败: {err}"))?
+    {
+        let name: String = row
+            .get(1)
+            .map_err(|err| format!("读取装备行为表结构失败: {err}"))?;
+        if name == "star" {
+            has_star = true;
+            break;
+        }
+    }
+    drop(rows);
+    drop(stmt);
+
+    if has_star {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "ALTER TABLE equipment_actions RENAME TO equipment_actions_old;
+         CREATE TABLE equipment_actions (
+            equipment_short TEXT NOT NULL,
+            star INTEGER NOT NULL DEFAULT 0,
+            trigger TEXT NOT NULL,
+            action TEXT NOT NULL,
+            target TEXT NOT NULL,
+            amount REAL,
+            duration REAL,
+            count INTEGER,
+            source_text TEXT NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (equipment_short, star, trigger, action, target, sort_order),
+            FOREIGN KEY (equipment_short) REFERENCES equipment(short) ON DELETE CASCADE
+         );
+         INSERT OR IGNORE INTO equipment_actions
+            (equipment_short, star, trigger, action, target, amount, duration, count, source_text, sort_order)
+         SELECT equipment_short, 0, trigger, action, target, amount, duration, count, source_text, sort_order
+         FROM equipment_actions_old;
+         DROP TABLE equipment_actions_old;",
+    )
+    .map_err(|err| format!("升级装备行为表结构失败: {err}"))
+}
+
 fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<(), String> {
     let pragma = format!("PRAGMA table_info({table})");
     let mut stmt = conn
@@ -490,8 +658,33 @@ fn leak_text(value: String) -> &'static str {
     Box::leak(value.into_boxed_str())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn synced_terms_include_crit_burn_and_poison() {
+        let mut conn = open_equipment_db().expect("open equipment db");
+        sync_catalog(&mut conn).expect("sync equipment catalog");
 
+        let rows = [
+            ("暴击", "有一定几率造成2倍伤害。"),
+            (
+                "灼伤",
+                "每秒受到等同于当前灼伤层数的伤害，每秒层数减少10%。",
+            ),
+            ("中毒", "每秒受到等同于当前中毒层数的伤害，无视护甲。"),
+        ];
 
-
-
+        for (term, expected) in rows {
+            let actual: String = conn
+                .query_row(
+                    "SELECT description FROM attribute_terms WHERE term = ?1",
+                    params![term],
+                    |row| row.get(0),
+                )
+                .expect("term exists");
+            assert_eq!(actual, expected);
+        }
+    }
+}

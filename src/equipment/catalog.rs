@@ -534,9 +534,9 @@ pub const EQUIPMENT_ACTIONS: &[ActionSeed] = &[
         trigger: "active_use",
         action: "freezing_normal_weapon_attack",
         target: "enemy",
-        amount: None,
-        duration: None,
-        count: None,
+        amount: Some(1.0),
+        duration: Some(2.0),
+        count: Some(2),
         source_text: "冰魄",
         sort_order: 10,
     },
@@ -567,7 +567,7 @@ pub const EQUIPMENT_ACTIONS: &[ActionSeed] = &[
         trigger: "on_freeze_source",
         action: "add_freeze_attack_stack",
         target: "self_weapons",
-        amount: None,
+        amount: Some(65.0),
         duration: None,
         count: Some(7),
         source_text: "冰魄",
@@ -1061,6 +1061,18 @@ pub const ATTRIBUTE_TERMS: &[AttributeTermSeed] = &[
         description: "减少所有来源的伤害，不含中毒、灼伤伤害",
     },
     AttributeTermSeed {
+        term: "暴击",
+        description: "有一定几率造成2倍伤害。",
+    },
+    AttributeTermSeed {
+        term: "灼伤",
+        description: "每秒受到等同于当前灼伤层数的伤害，每秒层数减少10%。",
+    },
+    AttributeTermSeed {
+        term: "中毒",
+        description: "每秒受到等同于当前中毒层数的伤害，无视护甲。",
+    },
+    AttributeTermSeed {
         term: "蓄力攻击",
         description: "消耗剑势发动高额伤害攻击，可被振刀克制",
     },
@@ -1075,10 +1087,6 @@ pub const ATTRIBUTE_TERMS: &[AttributeTermSeed] = &[
     AttributeTermSeed {
         term: "护甲",
         description: "优先吸收受到的伤害。",
-    },
-    AttributeTermSeed {
-        term: "暴击",
-        description: "暴击命中时触发的额外效果标签。",
     },
     AttributeTermSeed {
         term: "吸血",
